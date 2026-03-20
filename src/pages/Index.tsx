@@ -1,643 +1,458 @@
 import { useEffect, useRef, useState, useCallback } from "react";
+import * as THREE from "three";
 
-// ─── Constants ───────────────────────────────────────────────────────────────
-const W = 390;
-const H = 700;
-const GROUND_Y = H - 100;
-const PLAYER_R = 22;
-const GRAVITY = 0.55;
-const JUMP_FORCE = -13.5;
-const JUMP_HOLD = -0.6;
-const HOLD_FRAMES = 14;
-const BASE_SPEED = 4.2;
-const COIN_R = 14;
-
-// Merge level configs
-const MERGE_LEVELS = [
-  { color: "#00ff88", glow: "#00ff88", label: "1", pts: 10 },
-  { color: "#00cfff", glow: "#00cfff", label: "2", pts: 30 },
-  { color: "#a855f7", glow: "#a855f7", label: "3", pts: 80 },
-  { color: "#f97316", glow: "#f97316", label: "4", pts: 200 },
-  { color: "#fbbf24", glow: "#fbbf24", label: "5", pts: 500 },
-];
-
-const BONUS_TYPES = ["magnet", "shield", "boost"] as const;
-type BonusType = (typeof BONUS_TYPES)[number];
-
-const BONUS_COLORS: Record<BonusType, string> = {
-  magnet: "#ec4899",
-  shield: "#00cfff",
-  boost: "#fbbf24",
-};
-const BONUS_ICONS: Record<BonusType, string> = {
-  magnet: "🧲",
-  shield: "🛡️",
-  boost: "⚡",
-};
+// ─── Config ──────────────────────────────────────────────────────────────────
+const LANE_W = 2.2;
+const TRACK_W = LANE_W * 3;
+const TILE_LEN = 8;
+const TILE_COUNT = 20;
+const BASE_SPEED = 0.18;
+const GRAVITY = -0.028;
+const JUMP_V = 0.38;
+const HOLD_ADD = 0.018;
+const HOLD_MAX = 12;
+const PLAYER_Y_BASE = 0.5;
+const COIN_COLORS = [0x00ff88, 0x00cfff, 0xa855f7, 0xf97316, 0xfbbf24];
+const MERGE_PTS = [10, 30, 80, 200, 500];
+const MERGE_LABELS = ["1", "2", "3", "4", "5"];
 
 type GameState = "IDLE" | "PLAYING" | "DEAD";
 
-interface Coin {
-  id: number;
-  x: number;
-  y: number;
-  level: number;
-  vy: number;
-  collected: boolean;
-  mergeAnim: number;
+interface Coin3D { mesh: THREE.Mesh; level: number; z: number; collected: boolean }
+interface Obstacle3D { mesh: THREE.Group; z: number; type: "spike" | "wall" }
+interface BonusItem3D { mesh: THREE.Mesh; z: number; type: "magnet" | "shield" | "boost"; collected: boolean }
+interface Particle3D { mesh: THREE.Mesh; vx: number; vy: number; vz: number; life: number }
+
+function neonMat(color: number, emissive = 0.9) {
+  return new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: emissive, roughness: 0.2, metalness: 0.6 });
 }
 
-interface Obstacle {
-  id: number;
-  x: number;
-  type: "spike" | "pit" | "wall";
-  w: number;
-  h: number;
-}
-
-interface BonusItem {
-  id: number;
-  x: number;
-  y: number;
-  type: BonusType;
-  collected: boolean;
-}
-
-interface Particle {
-  x: number; y: number;
-  vx: number; vy: number;
-  color: string;
-  life: number;
-  maxLife: number;
-  r: number;
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-let _uid = 0;
-const uid = () => ++_uid;
-
-function scaleCanvas(canvas: HTMLCanvasElement) {
-  const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.getBoundingClientRect();
-  canvas.width = rect.width * dpr;
-  canvas.height = rect.height * dpr;
-  const ctx = canvas.getContext("2d")!;
-  ctx.scale(dpr, dpr);
-  return { sw: rect.width, sh: rect.height };
-}
-
-// ─── Main Component ──────────────────────────────────────────────────────────
 export default function Index() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const mountRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef(0);
 
-  // Game state refs (no re-render needed for game loop)
-  const gs = useRef<GameState>("IDLE");
-  const playerY = useRef(GROUND_Y - PLAYER_R);
-  const playerVY = useRef(0);
-  const onGround = useRef(true);
-  const jumpPressed = useRef(false);
-  const holdFrames = useRef(0);
-  const scrollX = useRef(0);
-  const speed = useRef(BASE_SPEED);
-  const t = useRef(0);
-  const score = useRef(0);
-  const coins = useRef<Coin[]>([]);
-  const obstacles = useRef<Obstacle[]>([]);
-  const bonusItems = useRef<BonusItem[]>([]);
-  const particles = useRef<Particle[]>([]);
-  const inventory = useRef<number[]>([]); // coin levels collected, max 9
-  const magnetActive = useRef(0); // frames left
-  const shieldActive = useRef(0);
-  const boostActive = useRef(0);
-  const shakeFrames = useRef(0);
-  const sw = useRef(W);
-  const sh = useRef(H);
-  const pitX = useRef<number | null>(null); // current pit x offset
-
-  // React state for UI
   const [gameState, setGameState] = useState<GameState>("IDLE");
-  const [displayScore, setDisplayScore] = useState(0);
-  const [highScore, setHighScore] = useState(() => Number(localStorage.getItem("jmHS") || 0));
+  const [score, setScore] = useState(0);
+  const [highScore, setHighScore] = useState(() => Number(localStorage.getItem("jm3dHS") || 0));
   const [inv, setInv] = useState<number[]>([]);
-  const [bonuses, setBonuses] = useState({ magnet: 0, shield: 0, boost: 0 });
+  const [bonusBars, setBonusBars] = useState({ magnet: 0, shield: 0, boost: 0 });
   const [deathScore, setDeathScore] = useState(0);
 
-  // ── Spawn helpers ──
-  const spawnCoins = useCallback(() => {
-    const count = 2 + Math.floor(Math.random() * 3);
-    const baseX = sw.current + 60 + Math.random() * 200;
-    const level = Math.min(4, Math.floor(Math.random() * (1 + score.current / 500)));
-    for (let i = 0; i < count; i++) {
-      const floating = Math.random() > 0.4;
-      coins.current.push({
-        id: uid(), x: baseX + i * 38, level,
-        y: floating ? GROUND_Y - PLAYER_R * 2 - 40 - Math.random() * 60 : GROUND_Y - COIN_R - 2,
-        vy: 0, collected: false, mergeAnim: 0,
-      });
+  const gs = useRef<GameState>("IDLE");
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const playerMesh = useRef<THREE.Mesh | null>(null);
+  const shieldRing = useRef<THREE.Mesh | null>(null);
+  const playerVY = useRef(0);
+  const playerY = useRef(PLAYER_Y_BASE);
+  const onGround = useRef(true);
+  const jumpHeld = useRef(false);
+  const holdFrames = useRef(HOLD_MAX);
+  const scrollZ = useRef(0);
+  const speed = useRef(BASE_SPEED);
+  const ticks = useRef(0);
+  const scoreRef = useRef(0);
+  const coins = useRef<Coin3D[]>([]);
+  const obstacles = useRef<Obstacle3D[]>([]);
+  const bonusItems = useRef<BonusItem3D[]>([]);
+  const particles = useRef<Particle3D[]>([]);
+  const inventory = useRef<number[]>([]);
+  const magnetT = useRef(0);
+  const shieldT = useRef(0);
+  const boostT = useRef(0);
+  const tiles = useRef<THREE.Object3D[]>([]);
+  const lastSpawnZ = useRef(-12);
+
+  // ── Init Three.js ──
+  const initThree = useCallback(() => {
+    const mount = mountRef.current!;
+    const w = mount.clientWidth, h = mount.clientHeight;
+
+    const sc = new THREE.Scene();
+    sc.fog = new THREE.FogExp2(0x030712, 0.036);
+    sceneRef.current = sc;
+
+    const cam = new THREE.PerspectiveCamera(62, w / h, 0.1, 200);
+    cam.position.set(0, 4.5, 8);
+    cam.lookAt(0, 0.5, -10);
+    cameraRef.current = cam;
+
+    const ren = new THREE.WebGLRenderer({ antialias: true });
+    ren.setSize(w, h);
+    ren.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    ren.shadowMap.enabled = true;
+    ren.shadowMap.type = THREE.PCFSoftShadowMap;
+    ren.toneMapping = THREE.ACESFilmicToneMapping;
+    ren.toneMappingExposure = 1.3;
+    mount.appendChild(ren.domElement);
+    rendererRef.current = ren;
+
+    // Lights
+    sc.add(new THREE.AmbientLight(0x080818, 3));
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+    dir.position.set(4, 10, 4);
+    dir.castShadow = true;
+    sc.add(dir);
+    const nl = new THREE.PointLight(0x00ff88, 4, 22);
+    nl.position.set(0, 4, -5);
+    sc.add(nl);
+
+    // Track
+    const trackGroup = new THREE.Group();
+    sc.add(trackGroup);
+    for (let i = 0; i < TILE_COUNT; i++) {
+      const geo = new THREE.BoxGeometry(TRACK_W, 0.18, TILE_LEN);
+      const mat = new THREE.MeshStandardMaterial({ color: 0x0a0f1e, roughness: 0.85, metalness: 0.2 });
+      const tile = new THREE.Mesh(geo, mat);
+      tile.receiveShadow = true;
+      tile.position.z = -i * TILE_LEN;
+      trackGroup.add(tile);
+      tiles.current.push(tile);
+
+      // Edge glow strips
+      for (const side of [-1, 1]) {
+        const sg = new THREE.BoxGeometry(0.07, 0.14, TILE_LEN);
+        const sm2 = new THREE.MeshStandardMaterial({ color: 0x00cfff, emissive: 0x00cfff, emissiveIntensity: 1.4 });
+        const strip = new THREE.Mesh(sg, sm2);
+        strip.position.set(side * (TRACK_W / 2 + 0.035), 0.07, -i * TILE_LEN);
+        trackGroup.add(strip);
+      }
+
+      // Lane lines
+      for (let l = -1; l <= 1; l++) {
+        const lg = new THREE.BoxGeometry(0.035, 0.015, TILE_LEN);
+        const lm = new THREE.MeshStandardMaterial({ color: 0x00ff88, emissive: 0x00ff88, emissiveIntensity: 0.7 });
+        const ln = new THREE.Mesh(lg, lm);
+        ln.position.set(l * LANE_W, 0.025, -i * TILE_LEN);
+        trackGroup.add(ln);
+      }
     }
+
+    // Player
+    const pGeo = new THREE.SphereGeometry(0.5, 32, 32);
+    const pMat = new THREE.MeshStandardMaterial({ color: 0x00ff88, emissive: 0x00ff88, emissiveIntensity: 0.9, roughness: 0.15, metalness: 0.7 });
+    const pm = new THREE.Mesh(pGeo, pMat);
+    pm.position.set(0, PLAYER_Y_BASE, 0);
+    pm.castShadow = true;
+    sc.add(pm);
+    playerMesh.current = pm;
+
+    // Shield ring
+    const sGeo = new THREE.TorusGeometry(0.72, 0.045, 12, 48);
+    const sMat = new THREE.MeshStandardMaterial({ color: 0x00cfff, emissive: 0x00cfff, emissiveIntensity: 1.6, transparent: true, opacity: 0 });
+    const sm = new THREE.Mesh(sGeo, sMat);
+    pm.add(sm);
+    shieldRing.current = sm;
+
+    // Player light
+    const pl = new THREE.PointLight(0x00ff88, 2.5, 6);
+    pm.add(pl);
+
+    // Resize handler
+    const onResize = () => {
+      const w2 = mount.clientWidth, h2 = mount.clientHeight;
+      cam.aspect = w2 / h2;
+      cam.updateProjectionMatrix();
+      ren.setSize(w2, h2);
+    };
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      mount.removeChild(ren.domElement);
+      ren.dispose();
+    };
   }, []);
 
-  const spawnBonus = useCallback(() => {
-    const type = BONUS_TYPES[Math.floor(Math.random() * 3)];
-    bonusItems.current.push({
-      id: uid(), x: sw.current + 60 + Math.random() * 150,
-      y: GROUND_Y - PLAYER_R * 2 - 50 - Math.random() * 40, type, collected: false,
-    });
-  }, []);
-
-  const spawnObstacle = useCallback(() => {
+  // ── Spawn ──
+  const spawnWave = useCallback(() => {
+    const sc = sceneRef.current!;
     const r = Math.random();
+
     if (r < 0.5) {
-      obstacles.current.push({ id: uid(), x: sw.current + 60, type: "spike", w: 28, h: 36 });
-    } else if (r < 0.8) {
-      obstacles.current.push({ id: uid(), x: sw.current + 60, type: "wall", w: 22, h: 50 });
+      // Coins cluster
+      const level = Math.min(4, Math.floor(Math.random() * (1 + scoreRef.current / 300)));
+      const lane = (Math.floor(Math.random() * 3) - 1) * LANE_W;
+      const count = 2 + Math.floor(Math.random() * 4);
+      for (let i = 0; i < count; i++) {
+        const geo = new THREE.SphereGeometry(0.28 + level * 0.06, 20, 20);
+        const mat = neonMat(COIN_COLORS[level], 1.3);
+        const m = new THREE.Mesh(geo, mat);
+        const floating = Math.random() > 0.35;
+        m.position.set(lane, floating ? 1.4 + Math.random() * 0.9 : 0.55, lastSpawnZ.current - 4 - i * 2.4);
+        sc.add(m);
+        coins.current.push({ mesh: m, level, z: m.position.z, collected: false });
+      }
+      lastSpawnZ.current -= 4 + count * 2.4 + 2;
+    } else if (r < 0.85) {
+      // Obstacle
+      const type = Math.random() > 0.45 ? "spike" : "wall";
+      const lane = (Math.floor(Math.random() * 3) - 1) * LANE_W;
+      const group = new THREE.Group();
+      if (type === "spike") {
+        const m = new THREE.Mesh(new THREE.ConeGeometry(0.42, 1.5, 6), neonMat(0xef4444, 1.5));
+        m.position.y = 0.75;
+        group.add(m);
+        const base = new THREE.Mesh(new THREE.TorusGeometry(0.44, 0.04, 8, 24), neonMat(0xef4444, 2));
+        group.add(base);
+      } else {
+        const m = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.9, 0.55), neonMat(0x7c3aed, 1.3));
+        m.position.y = 0.95;
+        group.add(m);
+        const top = new THREE.Mesh(new THREE.BoxGeometry(0.65, 0.09, 0.65), neonMat(0xa855f7, 2.2));
+        top.position.y = 1.9;
+        group.add(top);
+      }
+      group.position.set(lane, 0, lastSpawnZ.current - 8 - Math.random() * 4);
+      sc.add(group);
+      obstacles.current.push({ mesh: group, z: group.position.z, type });
+      lastSpawnZ.current = group.position.z - 2;
+    } else {
+      // Bonus
+      const types = ["magnet", "shield", "boost"] as const;
+      const type = types[Math.floor(Math.random() * 3)];
+      const colors = { magnet: 0xec4899, shield: 0x00cfff, boost: 0xfbbf24 };
+      const m = new THREE.Mesh(new THREE.OctahedronGeometry(0.38, 0), neonMat(colors[type], 2));
+      m.position.set((Math.floor(Math.random() * 3) - 1) * LANE_W, 1.3, lastSpawnZ.current - 6);
+      sc.add(m);
+      bonusItems.current.push({ mesh: m, z: m.position.z, type, collected: false });
+      lastSpawnZ.current -= 8;
     }
-    // pit handled via pitX
   }, []);
 
-  const addParticles = useCallback((x: number, y: number, color: string, count = 10) => {
+  const spawnParticles = useCallback((pos: THREE.Vector3, color: number, count = 12) => {
+    const sc = sceneRef.current!;
     for (let i = 0; i < count; i++) {
-      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.5;
-      const spd = 2 + Math.random() * 4;
-      particles.current.push({
-        x, y, vx: Math.cos(angle) * spd, vy: Math.sin(angle) * spd - 2,
-        color, life: 30 + Math.random() * 20, maxLife: 50, r: 3 + Math.random() * 4,
-      });
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(0.06 + Math.random() * 0.07, 6, 6),
+        new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 2, transparent: true, opacity: 1 })
+      );
+      m.position.copy(pos);
+      sc.add(m);
+      const a = Math.random() * Math.PI * 2;
+      const spd = 0.06 + Math.random() * 0.1;
+      particles.current.push({ mesh: m, vx: Math.cos(a) * spd, vy: 0.07 + Math.random() * 0.1, vz: Math.sin(a) * spd * 0.5, life: 35 + Math.random() * 20 });
     }
   }, []);
 
-  // ── Merge logic ──
-  const tryMerge = useCallback((newLevel: number) => {
-    const idx = inventory.current.lastIndexOf(newLevel);
-    const idx2 = inventory.current.indexOf(newLevel);
-    const count = inventory.current.filter(l => l === newLevel).length;
-    if (count >= 3) {
-      // Remove 3 of that level, add 1 of next
+  const tryMerge = useCallback((level: number) => {
+    if (inventory.current.filter(l => l === level).length >= 3) {
       let removed = 0;
-      inventory.current = inventory.current.filter(l => {
-        if (l === newLevel && removed < 3) { removed++; return false; }
-        return true;
-      });
-      const merged = Math.min(newLevel + 1, 4);
+      inventory.current = inventory.current.filter(l => { if (l === level && removed < 3) { removed++; return false; } return true; });
+      const merged = Math.min(level + 1, 4);
       inventory.current.push(merged);
-      const pts = MERGE_LEVELS[merged].pts;
-      score.current += pts;
-      setDisplayScore(score.current);
+      scoreRef.current += MERGE_PTS[merged];
+      setScore(scoreRef.current);
       setInv([...inventory.current]);
-      return merged;
     }
-    void idx; void idx2;
-    return -1;
-  }, []);
-
-  // ── Jump ──
-  const doJump = useCallback(() => {
-    if (gs.current !== "PLAYING") return;
-    if (onGround.current) {
-      playerVY.current = JUMP_FORCE;
-      onGround.current = false;
-      holdFrames.current = 0;
-    }
-  }, []);
-
-  // ── Init / Reset ──
-  const startGame = useCallback(() => {
-    playerY.current = GROUND_Y - PLAYER_R;
-    playerVY.current = 0;
-    onGround.current = true;
-    jumpPressed.current = false;
-    holdFrames.current = 0;
-    scrollX.current = 0;
-    speed.current = BASE_SPEED;
-    t.current = 0;
-    score.current = 0;
-    coins.current = [];
-    obstacles.current = [];
-    bonusItems.current = [];
-    particles.current = [];
-    inventory.current = [];
-    magnetActive.current = 0;
-    shieldActive.current = 0;
-    boostActive.current = 0;
-    shakeFrames.current = 0;
-    pitX.current = null;
-    gs.current = "PLAYING";
-    setGameState("PLAYING");
-    setDisplayScore(0);
-    setInv([]);
-    setBonuses({ magnet: 0, shield: 0, boost: 0 });
-  }, []);
-
-  // ── Draw ──
-  const draw = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d")!;
-    const W2 = sw.current;
-    const H2 = sh.current;
-    const gY = GROUND_Y * (H2 / H);
-    const scaleY = H2 / H;
-    const scaleX2 = W2 / W;
-
-    ctx.save();
-    if (shakeFrames.current > 0) {
-      shakeFrames.current--;
-      ctx.translate((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 4);
-    }
-
-    // ── Background ──
-    ctx.fillStyle = "#030712";
-    ctx.fillRect(0, 0, W2, H2);
-
-    // Stars
-    ctx.fillStyle = "rgba(255,255,255,0.4)";
-    for (let i = 0; i < 60; i++) {
-      const sx = ((i * 137 + scrollX.current * 0.15) % W2 + W2) % W2;
-      const sy = (i * 73) % (gY * 0.9);
-      const sr = 0.5 + (i % 3) * 0.4;
-      ctx.beginPath();
-      ctx.arc(sx, sy, sr, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Grid lines (perspective)
-    ctx.strokeStyle = "rgba(0,200,255,0.04)";
-    ctx.lineWidth = 1;
-    for (let i = 0; i < 10; i++) {
-      const lx = ((i * (W2 / 9)) - (scrollX.current * 0.5) % (W2 / 9) + W2) % W2;
-      ctx.beginPath(); ctx.moveTo(lx, gY * 0.3); ctx.lineTo(lx - W2 * 0.3, H2); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(lx, gY * 0.3); ctx.lineTo(lx + W2 * 0.3, H2); ctx.stroke();
-    }
-
-    // ── Ground ──
-    const glowGrad = ctx.createLinearGradient(0, gY, 0, H2);
-    glowGrad.addColorStop(0, "#00ff8822");
-    glowGrad.addColorStop(0.2, "#00ff8808");
-    glowGrad.addColorStop(1, "transparent");
-    ctx.fillStyle = glowGrad;
-    ctx.fillRect(0, gY, W2, H2 - gY);
-
-    ctx.strokeStyle = "#00ff88";
-    ctx.shadowColor = "#00ff88";
-    ctx.shadowBlur = 12;
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(0, gY); ctx.lineTo(W2, gY); ctx.stroke();
-    ctx.shadowBlur = 0;
-
-    // Ground dashes
-    ctx.strokeStyle = "rgba(0,255,136,0.25)";
-    ctx.lineWidth = 1;
-    ctx.setLineDash([20, 15]);
-    ctx.lineDashOffset = -(scrollX.current * 0.8) % 35;
-    ctx.beginPath(); ctx.moveTo(0, gY + 8); ctx.lineTo(W2, gY + 8); ctx.stroke();
-    ctx.setLineDash([]);
-
-    // ── Pit ──
-    if (pitX.current !== null) {
-      const px = pitX.current - scrollX.current;
-      const pw = 90 * scaleX2;
-      if (px + pw > 0 && px < W2) {
-        ctx.fillStyle = "#030712";
-        ctx.fillRect(px, gY, pw, H2 - gY + 2);
-        ctx.strokeStyle = "#ef444488";
-        ctx.lineWidth = 2;
-        ctx.shadowColor = "#ef4444";
-        ctx.shadowBlur = 8;
-        ctx.beginPath(); ctx.moveTo(px, gY); ctx.lineTo(px, H2); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(px + pw, gY); ctx.lineTo(px + pw, H2); ctx.stroke();
-        ctx.shadowBlur = 0;
-      }
-    }
-
-    // ── Obstacles ──
-    obstacles.current.forEach(ob => {
-      const ox = ob.x - scrollX.current;
-      if (ob.type === "spike") {
-        const sx = ox * scaleX2 + W2 * (1 - scaleX2) / 2;
-        ctx.fillStyle = "#ef4444";
-        ctx.shadowColor = "#ef4444";
-        ctx.shadowBlur = 14;
-        ctx.beginPath();
-        ctx.moveTo(sx, gY);
-        ctx.lineTo(sx + ob.w / 2, gY - ob.h * scaleY);
-        ctx.lineTo(sx + ob.w, gY);
-        ctx.closePath();
-        ctx.fill();
-        ctx.shadowBlur = 0;
-      } else if (ob.type === "wall") {
-        const wx = ox * scaleX2 + W2 * (1 - scaleX2) / 2;
-        ctx.fillStyle = "#7c3aed";
-        ctx.shadowColor = "#a855f7";
-        ctx.shadowBlur = 12;
-        ctx.fillRect(wx, gY - ob.h * scaleY, ob.w * scaleX2, ob.h * scaleY);
-        ctx.shadowBlur = 0;
-      }
-    });
-
-    // ── Bonus items ──
-    bonusItems.current.filter(b => !b.collected).forEach(b => {
-      const bx = (b.x - scrollX.current) * scaleX2 + W2 * (1 - scaleX2) / 2;
-      const by = b.y * scaleY;
-      const pulse = 0.9 + 0.1 * Math.sin(t.current * 0.1);
-      ctx.shadowColor = BONUS_COLORS[b.type];
-      ctx.shadowBlur = 18 * pulse;
-      ctx.beginPath();
-      ctx.arc(bx, by, 18 * scaleX2, 0, Math.PI * 2);
-      ctx.fillStyle = BONUS_COLORS[b.type] + "33";
-      ctx.fill();
-      ctx.strokeStyle = BONUS_COLORS[b.type];
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.shadowBlur = 0;
-      ctx.font = `${14 * scaleX2}px serif`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText(BONUS_ICONS[b.type], bx, by);
-    });
-
-    // ── Coins ──
-    coins.current.filter(c => !c.collected).forEach(c => {
-      const cx2 = (c.x - scrollX.current) * scaleX2 + W2 * (1 - scaleX2) / 2;
-      const cy2 = c.y * scaleY;
-      const cfg = MERGE_LEVELS[c.level];
-      const r2 = (COIN_R + c.level * 2) * scaleX2;
-      const ma = c.mergeAnim > 0 ? 1 + c.mergeAnim * 0.03 : 1;
-      ctx.save();
-      ctx.translate(cx2, cy2);
-      ctx.scale(ma, ma);
-      ctx.shadowColor = cfg.glow;
-      ctx.shadowBlur = 16;
-      const cg = ctx.createRadialGradient(0, -r2 * 0.3, 0, 0, 0, r2);
-      cg.addColorStop(0, "#ffffff");
-      cg.addColorStop(0.4, cfg.color);
-      cg.addColorStop(1, cfg.color + "88");
-      ctx.beginPath();
-      ctx.arc(0, 0, r2, 0, Math.PI * 2);
-      ctx.fillStyle = cg;
-      ctx.fill();
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = "#000000bb";
-      ctx.font = `bold ${9 * scaleX2}px 'Orbitron', monospace`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText(cfg.label, 0, 0);
-      ctx.restore();
-    });
-
-    // ── Player ──
-    const px = W2 * 0.22;
-    const py = playerY.current * scaleY;
-    const shieldOn = shieldActive.current > 0;
-    const magnetOn = magnetActive.current > 0;
-    const boostOn = boostActive.current > 0;
-
-    if (shieldOn) {
-      ctx.shadowColor = "#00cfff";
-      ctx.shadowBlur = 30;
-      ctx.strokeStyle = "#00cfff88";
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.arc(px, py, (PLAYER_R + 10) * scaleX2, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.shadowBlur = 0;
-    }
-
-    const pg = ctx.createRadialGradient(px - PLAYER_R * 0.3 * scaleX2, py - PLAYER_R * 0.3 * scaleY, 0, px, py, PLAYER_R * scaleX2);
-    const pc1 = boostOn ? "#fbbf24" : magnetOn ? "#ec4899" : "#00ff88";
-    const pc2 = boostOn ? "#f97316" : magnetOn ? "#a855f7" : "#00cfff";
-    pg.addColorStop(0, "#ffffff");
-    pg.addColorStop(0.35, pc1);
-    pg.addColorStop(1, pc2);
-    ctx.shadowColor = pc1;
-    ctx.shadowBlur = 22;
-    ctx.beginPath();
-    ctx.arc(px, py, PLAYER_R * scaleX2, 0, Math.PI * 2);
-    ctx.fillStyle = pg;
-    ctx.fill();
-    ctx.shadowBlur = 0;
-
-    // Trail
-    for (let i = 1; i <= 5; i++) {
-      ctx.globalAlpha = 0.12 * (6 - i);
-      ctx.beginPath();
-      ctx.arc(px - i * 8 * scaleX2, py, PLAYER_R * scaleX2 * (1 - i * 0.12), 0, Math.PI * 2);
-      ctx.fillStyle = pc2;
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-
-    // ── Particles ──
-    particles.current.forEach(p => {
-      const a = p.life / p.maxLife;
-      ctx.globalAlpha = a;
-      ctx.fillStyle = p.color;
-      ctx.shadowColor = p.color;
-      ctx.shadowBlur = 6;
-      ctx.beginPath();
-      ctx.arc(p.x * scaleX2 + W2 * (1 - scaleX2) / 2, p.y * scaleY, p.r * scaleX2, 0, Math.PI * 2);
-      ctx.fill();
-    });
-    ctx.globalAlpha = 1;
-    ctx.shadowBlur = 0;
-
-    ctx.restore();
   }, []);
 
   // ── Game Loop ──
   const loop = useCallback(() => {
-    if (gs.current !== "PLAYING") { draw(); rafRef.current = requestAnimationFrame(loop); return; }
+    const sc = sceneRef.current;
+    const cam = cameraRef.current;
+    const ren = rendererRef.current;
+    const pm = playerMesh.current;
+    if (!sc || !cam || !ren || !pm) { rafRef.current = requestAnimationFrame(loop); return; }
 
-    t.current++;
-    const spd = boostActive.current > 0 ? speed.current * 1.7 : speed.current;
-    scrollX.current += spd;
-    speed.current = BASE_SPEED + t.current * 0.0018;
+    if (gs.current === "PLAYING") {
+      ticks.current++;
+      const spd = boostT.current > 0 ? speed.current * 1.65 : speed.current;
+      speed.current = BASE_SPEED + ticks.current * 0.000022;
 
-    // Player physics
-    if (jumpPressed.current && !onGround.current && holdFrames.current < HOLD_FRAMES) {
-      playerVY.current += JUMP_HOLD;
-      holdFrames.current++;
-    }
-    playerVY.current += GRAVITY;
-    playerY.current += playerVY.current;
+      // Spawn
+      if (pm.position.z - 2 < lastSpawnZ.current + 40) spawnWave();
 
-    const gY = GROUND_Y;
-    // Ground check
-    if (playerY.current >= gY - PLAYER_R) {
-      playerY.current = gY - PLAYER_R;
-      playerVY.current = 0;
-      onGround.current = true;
-      holdFrames.current = HOLD_FRAMES;
-    }
+      // Jump
+      if (jumpHeld.current && !onGround.current && holdFrames.current < HOLD_MAX) {
+        playerVY.current += HOLD_ADD;
+        holdFrames.current++;
+      }
+      playerVY.current += GRAVITY;
+      playerY.current += playerVY.current;
+      if (playerY.current <= PLAYER_Y_BASE) {
+        playerY.current = PLAYER_Y_BASE;
+        playerVY.current = 0;
+        onGround.current = true;
+        holdFrames.current = HOLD_MAX;
+      }
+      pm.position.y = playerY.current;
+      pm.rotation.x += spd * 0.45;
 
-    // Bonuses tick
-    if (magnetActive.current > 0) { magnetActive.current--; setBonuses(b => ({ ...b, magnet: magnetActive.current })); }
-    if (shieldActive.current > 0) { shieldActive.current--; setBonuses(b => ({ ...b, shield: shieldActive.current })); }
-    if (boostActive.current > 0) { boostActive.current--; setBonuses(b => ({ ...b, boost: boostActive.current })); }
+      // Advance world
+      pm.position.z -= spd;
 
-    // Spawn
-    if (t.current % 90 === 0) spawnCoins();
-    if (t.current % 180 === 0) spawnObstacle();
-    if (t.current % 300 === 0 && Math.random() > 0.4) spawnBonus();
+      // Bonus timers
+      if (magnetT.current > 0) { magnetT.current--; setBonusBars(b => ({ ...b, magnet: magnetT.current })); }
+      if (shieldT.current > 0) { shieldT.current--; setBonusBars(b => ({ ...b, shield: shieldT.current })); }
+      if (boostT.current > 0) { boostT.current--; setBonusBars(b => ({ ...b, boost: boostT.current })); }
 
-    const px = W / 0.22 * 0.22; // player world x = scrollX + W*0.22
-    const pWorldX = scrollX.current + W * 0.22;
-    const pY = playerY.current;
+      // Shield ring
+      (shieldRing.current!.material as THREE.MeshStandardMaterial).opacity = shieldT.current > 0 ? 0.75 : 0;
+      shieldRing.current!.rotation.y += 0.06;
 
-    // Magnet
-    if (magnetActive.current > 0) {
+      // Player color
+      const pMat2 = pm.material as THREE.MeshStandardMaterial;
+      const pc = boostT.current > 0 ? 0xfbbf24 : magnetT.current > 0 ? 0xec4899 : 0x00ff88;
+      pMat2.color.setHex(pc); pMat2.emissive.setHex(pc);
+      (pm.children[1] as THREE.PointLight).color.setHex(pc);
+
+      const px = pm.position.x, py = pm.position.y, pz = pm.position.z;
+
+      // Magnet pull
+      if (magnetT.current > 0) {
+        coins.current.filter(c => !c.collected).forEach(c => {
+          const dx = px - c.mesh.position.x, dy = py - c.mesh.position.y, dz = pz - c.mesh.position.z;
+          if (Math.sqrt(dx * dx + dy * dy + dz * dz) < 5) { c.mesh.position.x += dx * 0.07; c.mesh.position.y += dy * 0.07; c.mesh.position.z += dz * 0.07; }
+        });
+      }
+
+      // Coin collect
       coins.current.filter(c => !c.collected).forEach(c => {
-        const dx = (pWorldX) - c.x;
-        const dy = (pY) - c.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < 180) { c.x += dx * 0.07; c.y += dy * 0.07; }
+        c.mesh.rotation.y += 0.04;
+        const dx = px - c.mesh.position.x, dy = py - c.mesh.position.y, dz = pz - c.mesh.position.z;
+        if (Math.sqrt(dx * dx + dy * dy + dz * dz) < 0.85) {
+          c.collected = true;
+          spawnParticles(c.mesh.position.clone(), COIN_COLORS[c.level], 10);
+          sc.remove(c.mesh);
+          scoreRef.current += MERGE_PTS[c.level];
+          setScore(scoreRef.current);
+          inventory.current.push(c.level);
+          if (inventory.current.length > 9) inventory.current.shift();
+          tryMerge(c.level);
+          setInv([...inventory.current]);
+        }
+      });
+
+      // Bonus collect
+      bonusItems.current.filter(b => !b.collected).forEach(b => {
+        b.mesh.rotation.y += 0.05; b.mesh.rotation.x += 0.03;
+        const dx = px - b.mesh.position.x, dy = py - b.mesh.position.y, dz = pz - b.mesh.position.z;
+        if (Math.sqrt(dx * dx + dy * dy + dz * dz) < 0.9) {
+          b.collected = true;
+          const bc = { magnet: 0xec4899, shield: 0x00cfff, boost: 0xfbbf24 };
+          spawnParticles(b.mesh.position.clone(), bc[b.type], 16);
+          sc.remove(b.mesh);
+          if (b.type === "magnet") magnetT.current = 300;
+          if (b.type === "shield") shieldT.current = 180;
+          if (b.type === "boost") boostT.current = 180;
+        }
+      });
+
+      // Obstacle collision
+      let dead = false;
+      obstacles.current.forEach(ob => {
+        const dx = Math.abs(px - ob.mesh.position.x);
+        const dz = Math.abs(pz - ob.mesh.position.z);
+        const hitH = ob.type === "spike" ? 1.5 : 1.9;
+        if (dx < 0.88 && dz < 0.88 && py < hitH) {
+          if (shieldT.current > 0) { shieldT.current = 0; spawnParticles(pm.position.clone(), 0x00cfff, 14); }
+          else dead = true;
+        }
+      });
+
+      if (dead) {
+        spawnParticles(pm.position.clone(), 0xef4444, 22);
+        gs.current = "DEAD";
+        setGameState("DEAD");
+        setDeathScore(scoreRef.current);
+        const hs = Math.max(scoreRef.current, Number(localStorage.getItem("jm3dHS") || 0));
+        localStorage.setItem("jm3dHS", String(hs));
+        setHighScore(hs);
+      }
+
+      // Cleanup
+      coins.current = coins.current.filter(c => { if (c.mesh.position.z > pm.position.z + 18) { sc.remove(c.mesh); return false; } return true; });
+      obstacles.current = obstacles.current.filter(o => { if (o.mesh.position.z > pm.position.z + 18) { sc.remove(o.mesh); return false; } return true; });
+      bonusItems.current = bonusItems.current.filter(b => { if (b.mesh.position.z > pm.position.z + 18) { sc.remove(b.mesh); return false; } return true; });
+
+      // Particles
+      particles.current.forEach(p => {
+        p.mesh.position.x += p.vx; p.mesh.position.y += p.vy; p.mesh.position.z += p.vz;
+        p.vy -= 0.004; p.life--;
+        (p.mesh.material as THREE.MeshStandardMaterial).opacity = Math.max(0, p.life / 55);
+      });
+      particles.current = particles.current.filter(p => { if (p.life <= 0) { sc.remove(p.mesh); return false; } return true; });
+
+      // Camera follow
+      const bob = onGround.current ? Math.sin(ticks.current * 0.13) * 0.04 : 0;
+      cam.position.set(px * 0.25, 4.5 + bob, pz + 8);
+      cam.lookAt(px * 0.15, py + 0.5, pz - 10);
+
+      // Move track with player
+      tiles.current.forEach(tile => {
+        if (tile.parent) {
+          tile.parent.position.z = pm.position.z;
+        }
       });
     }
 
-    // Coin collection
-    coins.current.filter(c => !c.collected).forEach(c => {
-      const dx = pWorldX - c.x;
-      const dy = pY - c.y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist < PLAYER_R + COIN_R + c.level * 2) {
-        c.collected = true;
-        score.current += MERGE_LEVELS[c.level].pts;
-        setDisplayScore(score.current);
-        inventory.current.push(c.level);
-        if (inventory.current.length > 9) inventory.current.shift();
-        addParticles(c.x - scrollX.current + sw.current * 0.22, c.y * (sh.current / H), MERGE_LEVELS[c.level].color, 8);
-        tryMerge(c.level);
-        setInv([...inventory.current]);
-      }
-    });
-
-    // Bonus collection
-    bonusItems.current.filter(b => !b.collected).forEach(b => {
-      const dx = pWorldX - b.x;
-      const dy = pY - b.y;
-      if (Math.sqrt(dx * dx + dy * dy) < PLAYER_R + 18) {
-        b.collected = true;
-        if (b.type === "magnet") magnetActive.current = 300;
-        if (b.type === "shield") shieldActive.current = 180;
-        if (b.type === "boost") boostActive.current = 180;
-        addParticles(b.x - scrollX.current + sw.current * 0.22, b.y * (sh.current / H), BONUS_COLORS[b.type], 14);
-      }
-    });
-
-    // Obstacle collision
-    let dead = false;
-    obstacles.current.forEach(ob => {
-      const obScreenX = ob.x - scrollX.current;
-      const px2 = W * 0.22;
-      if (obScreenX < px2 + PLAYER_R + ob.w / 2 && obScreenX + ob.w > px2 - PLAYER_R) {
-        if (ob.type === "spike" || ob.type === "wall") {
-          const topY = gY - ob.h;
-          if (pY + PLAYER_R > topY && pY - PLAYER_R < gY) {
-            if (shieldActive.current > 0) {
-              shieldActive.current = 0;
-              shakeFrames.current = 8;
-              addParticles(px2, pY * (sh.current / H), "#00cfff", 12);
-            } else {
-              dead = true;
-            }
-          }
-        }
-      }
-    });
-
-    // Pit check
-    if (pitX.current !== null) {
-      const pitScreenX = pitX.current - scrollX.current;
-      const pw = 90;
-      const px2 = W * 0.22;
-      if (pitScreenX < px2 + PLAYER_R && pitScreenX + pw > px2 - PLAYER_R) {
-        if (pY + PLAYER_R >= gY) {
-          if (shieldActive.current > 0) {
-            shieldActive.current = 0;
-            pitX.current = null;
-            shakeFrames.current = 8;
-          } else { dead = true; }
-        }
-      }
-      if (pitScreenX + pw < -100) pitX.current = null;
-    }
-    if (Math.random() < 0.002 && pitX.current === null) {
-      pitX.current = scrollX.current + sw.current + 80;
-    }
-
-    if (dead) {
-      shakeFrames.current = 15;
-      addParticles(W * 0.22, playerY.current * (sh.current / H), "#ef4444", 20);
-      gs.current = "DEAD";
-      setGameState("DEAD");
-      setDeathScore(score.current);
-      const hs = Math.max(score.current, Number(localStorage.getItem("jmHS") || 0));
-      localStorage.setItem("jmHS", String(hs));
-      setHighScore(hs);
-    }
-
-    // Update particles
-    particles.current = particles.current.filter(p => p.life > 0);
-    particles.current.forEach(p => { p.x += p.vx; p.y += p.vy; p.vy += 0.1; p.life--; });
-
-    // Cleanup
-    coins.current = coins.current.filter(c => c.x - scrollX.current > -100);
-    obstacles.current = obstacles.current.filter(ob => ob.x - scrollX.current > -200);
-    bonusItems.current = bonusItems.current.filter(b => !b.collected && b.x - scrollX.current > -100);
-
-    void px;
-    draw();
+    ren.render(sc, cam);
     rafRef.current = requestAnimationFrame(loop);
-  }, [draw, spawnCoins, spawnBonus, spawnObstacle, addParticles, tryMerge]);
+  }, [spawnWave, spawnParticles, tryMerge]);
 
-  // ── Input ──
+  // ── Start ──
+  const startGame = useCallback(() => {
+    const sc = sceneRef.current!;
+    [...coins.current, ...obstacles.current, ...bonusItems.current].forEach(o => sc.remove(o.mesh));
+    particles.current.forEach(p => sc.remove(p.mesh));
+    coins.current = []; obstacles.current = []; bonusItems.current = []; particles.current = [];
+    inventory.current = [];
+    scoreRef.current = 0;
+    speed.current = BASE_SPEED;
+    ticks.current = 0;
+    magnetT.current = 0; shieldT.current = 0; boostT.current = 0;
+    playerY.current = PLAYER_Y_BASE;
+    playerVY.current = 0;
+    onGround.current = true;
+    jumpHeld.current = false;
+    holdFrames.current = HOLD_MAX;
+    const pm = playerMesh.current!;
+    pm.position.set(0, PLAYER_Y_BASE, 0);
+    lastSpawnZ.current = pm.position.z - 12;
+    gs.current = "PLAYING";
+    setGameState("PLAYING");
+    setScore(0);
+    setInv([]);
+    setBonusBars({ magnet: 0, shield: 0, boost: 0 });
+  }, []);
+
   const pressJump = useCallback(() => {
-    jumpPressed.current = true;
-    if (gs.current === "IDLE" || gs.current === "DEAD") return;
-    doJump();
-  }, [doJump]);
-  const releaseJump = useCallback(() => { jumpPressed.current = false; }, []);
+    jumpHeld.current = true;
+    if (gs.current === "PLAYING" && onGround.current) {
+      playerVY.current = JUMP_V;
+      onGround.current = false;
+      holdFrames.current = 0;
+    }
+  }, []);
+  const releaseJump = useCallback(() => { jumpHeld.current = false; }, []);
 
   useEffect(() => {
-    const canvas = canvasRef.current!;
-    const onResize = () => {
-      const { sw: w, sh: h } = scaleCanvas(canvas);
-      sw.current = w; sh.current = h;
-    };
-    onResize();
-    window.addEventListener("resize", onResize);
-
+    const cleanup = initThree();
+    rafRef.current = requestAnimationFrame(loop);
     const onDown = (e: KeyboardEvent) => { if (e.code === "Space") { e.preventDefault(); pressJump(); } };
     const onUp = (e: KeyboardEvent) => { if (e.code === "Space") releaseJump(); };
     window.addEventListener("keydown", onDown);
     window.addEventListener("keyup", onUp);
-
-    rafRef.current = requestAnimationFrame(loop);
     return () => {
       cancelAnimationFrame(rafRef.current);
-      window.removeEventListener("resize", onResize);
+      cleanup?.();
       window.removeEventListener("keydown", onDown);
       window.removeEventListener("keyup", onUp);
     };
-  }, [loop, pressJump, releaseJump]);
+  }, [initThree, loop, pressJump, releaseJump]);
 
-  const accentColor = boostActive.current > 0 ? "#fbbf24" : magnetActive.current > 0 ? "#ec4899" : "#00ff88";
+  const accentColor = boostT.current > 0 ? "#fbbf24" : magnetT.current > 0 ? "#ec4899" : "#00ff88";
 
   return (
-    <div style={{
-      width: "100dvw", height: "100dvh", background: "#030712",
-      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-      fontFamily: "'Orbitron', monospace", userSelect: "none", overflow: "hidden", position: "relative",
-    }}>
-      {/* HUD top */}
-      <div style={{
-        position: "absolute", top: 0, left: 0, right: 0, zIndex: 20,
-        display: "flex", justifyContent: "space-between", alignItems: "flex-start",
-        padding: "12px 16px", pointerEvents: "none",
-      }}>
+    <div style={{ width: "100dvw", height: "100dvh", background: "#030712", position: "relative", overflow: "hidden", fontFamily: "'Orbitron', monospace", userSelect: "none" }}>
+      <div ref={mountRef} style={{ position: "absolute", inset: 0 }} onPointerDown={pressJump} onPointerUp={releaseJump} />
+
+      {/* Score HUD */}
+      <div style={{ position: "absolute", top: 0, left: 0, right: 0, zIndex: 20, display: "flex", justifyContent: "space-between", padding: "14px 18px", pointerEvents: "none" }}>
         <div>
           <div style={{ fontSize: 9, color: "#ffffff33", letterSpacing: "0.25em" }}>СЧЁТ</div>
-          <div style={{ fontSize: 26, fontWeight: 900, color: accentColor, textShadow: `0 0 14px ${accentColor}`, lineHeight: 1, transition: "color 0.5s" }}>{displayScore}</div>
+          <div style={{ fontSize: 28, fontWeight: 900, color: accentColor, textShadow: `0 0 14px ${accentColor}`, lineHeight: 1, transition: "color 0.5s" }}>{score}</div>
         </div>
         <div style={{ textAlign: "right" }}>
           <div style={{ fontSize: 9, color: "#ffffff33", letterSpacing: "0.25em" }}>РЕКОРД</div>
@@ -645,97 +460,67 @@ export default function Index() {
         </div>
       </div>
 
-      {/* Bonus timers */}
-      <div style={{
-        position: "absolute", top: 72, left: 16, zIndex: 20,
-        display: "flex", gap: 8, pointerEvents: "none",
-      }}>
-        {bonuses.magnet > 0 && <BonusBar icon="🧲" color="#ec4899" val={bonuses.magnet} max={300} />}
-        {bonuses.shield > 0 && <BonusBar icon="🛡️" color="#00cfff" val={bonuses.shield} max={180} />}
-        {bonuses.boost > 0 && <BonusBar icon="⚡" color="#fbbf24" val={bonuses.boost} max={180} />}
+      {/* Bonus bars */}
+      <div style={{ position: "absolute", top: 76, left: 18, zIndex: 20, display: "flex", gap: 8, pointerEvents: "none" }}>
+        {bonusBars.magnet > 0 && <BonusBar icon="🧲" color="#ec4899" val={bonusBars.magnet} max={300} />}
+        {bonusBars.shield > 0 && <BonusBar icon="🛡️" color="#00cfff" val={bonusBars.shield} max={180} />}
+        {bonusBars.boost > 0 && <BonusBar icon="⚡" color="#fbbf24" val={bonusBars.boost} max={180} />}
       </div>
 
       {/* Inventory */}
-      <div style={{
-        position: "absolute", bottom: 90, left: 0, right: 0, zIndex: 20,
-        display: "flex", justifyContent: "center", gap: 6, pointerEvents: "none",
-      }}>
+      <div style={{ position: "absolute", bottom: 20, left: 0, right: 0, zIndex: 20, display: "flex", justifyContent: "center", gap: 6, pointerEvents: "none" }}>
         {Array.from({ length: 9 }, (_, i) => {
           const lvl = inv[i];
-          const cfg = lvl !== undefined ? MERGE_LEVELS[lvl] : null;
+          const color = lvl !== undefined ? `#${COIN_COLORS[lvl].toString(16).padStart(6, "0")}` : null;
           return (
             <div key={i} style={{
-              width: 32, height: 32, borderRadius: "50%",
-              border: cfg ? `2px solid ${cfg.color}` : "1px solid #ffffff11",
-              background: cfg ? `${cfg.color}22` : "#ffffff05",
+              width: 30, height: 30, borderRadius: "50%",
+              border: color ? `2px solid ${color}` : "1px solid #ffffff11",
+              background: color ? `${color}22` : "#ffffff05",
               display: "flex", alignItems: "center", justifyContent: "center",
-              boxShadow: cfg ? `0 0 10px ${cfg.color}44` : "none",
-              fontSize: 10, fontWeight: 700, color: cfg?.color || "transparent",
-              transition: "all 0.2s ease",
+              boxShadow: color ? `0 0 8px ${color}55` : "none",
+              fontSize: 9, fontWeight: 700, color: color || "transparent",
             }}>
-              {cfg ? cfg.label : ""}
+              {lvl !== undefined ? MERGE_LABELS[lvl] : ""}
             </div>
           );
         })}
       </div>
 
-      {/* Canvas */}
-      <canvas
-        ref={canvasRef}
-        style={{ width: "100%", height: "100%", position: "absolute", inset: 0, touchAction: "none" }}
-        onPointerDown={pressJump}
-        onPointerUp={releaseJump}
-      />
-
       {/* Overlay */}
       {(gameState === "IDLE" || gameState === "DEAD") && (
-        <div style={{
-          position: "absolute", inset: 0, zIndex: 30,
-          background: "rgba(3,7,18,0.82)",
-          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16,
-        }}>
+        <div style={{ position: "absolute", inset: 0, zIndex: 30, background: "rgba(3,7,18,0.78)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16 }}>
           {gameState === "DEAD" && (
             <>
-              <div style={{ fontSize: 20, color: "#ef4444", fontWeight: 700, letterSpacing: "0.15em", textShadow: "0 0 20px #ef4444" }}>
-                GAME OVER
-              </div>
-              <div style={{ fontSize: 52, fontWeight: 900, color: "#ffffff", lineHeight: 1 }}>{deathScore}</div>
-              {deathScore >= highScore && deathScore > 0 && (
+              <div style={{ fontSize: 20, color: "#ef4444", fontWeight: 700, letterSpacing: "0.15em", textShadow: "0 0 20px #ef4444" }}>GAME OVER</div>
+              <div style={{ fontSize: 56, fontWeight: 900, color: "#ffffff", lineHeight: 1 }}>{deathScore}</div>
+              {deathScore > 0 && deathScore >= highScore && (
                 <div style={{ fontSize: 11, color: "#fbbf24", letterSpacing: "0.25em", textShadow: "0 0 10px #fbbf24" }}>✦ НОВЫЙ РЕКОРД ✦</div>
               )}
             </>
           )}
-
           {gameState === "IDLE" && (
-            <div style={{ textAlign: "center", marginBottom: 8 }}>
-              <div style={{ fontSize: 28, fontWeight: 900, color: "#00ff88", textShadow: "0 0 20px #00ff88", letterSpacing: "0.15em" }}>
-                JUMP &amp; MERGE
-              </div>
-              <div style={{ fontSize: 11, color: "#ffffff33", letterSpacing: "0.3em", marginTop: 6, fontFamily: "'Rajdhani', sans-serif" }}>
-                COLOR DASH
-              </div>
-              <div style={{ marginTop: 24, fontSize: 11, color: "#ffffff44", letterSpacing: "0.1em", fontFamily: "'Rajdhani', sans-serif", lineHeight: 1.8 }}>
-                Собирай 3 круга одного цвета — они сольются!<br />
-                Перепрыгивай шипы и ямы.<br />
-                Лови бонусы: 🧲 🛡️ ⚡
+            <div style={{ textAlign: "center", marginBottom: 4 }}>
+              <div style={{ fontSize: 30, fontWeight: 900, color: "#00ff88", textShadow: "0 0 22px #00ff88", letterSpacing: "0.12em" }}>JUMP &amp; MERGE</div>
+              <div style={{ fontSize: 11, color: "#ffffff33", letterSpacing: "0.3em", marginTop: 6, fontFamily: "'Rajdhani', sans-serif" }}>COLOR DASH · 3D</div>
+              <div style={{ marginTop: 22, fontSize: 11, color: "#ffffff44", letterSpacing: "0.08em", fontFamily: "'Rajdhani', sans-serif", lineHeight: 2 }}>
+                Собирай 3 шара одного цвета — они сольются!<br />
+                Перепрыгивай шипы и стены.<br />
+                Лови бонусы: 🧲 магнит · 🛡️ щит · ⚡ буст
               </div>
             </div>
           )}
-
-          <button
-            onClick={startGame}
-            style={{
-              padding: "13px 40px", background: "transparent",
-              border: "2px solid #00ff88", borderRadius: 4, color: "#00ff88",
-              fontFamily: "'Orbitron', monospace", fontSize: 13, fontWeight: 700,
-              letterSpacing: "0.2em", cursor: "pointer",
-              textShadow: "0 0 10px #00ff88", boxShadow: "0 0 20px #00ff8833",
-            }}
-          >
+          <button onClick={startGame} style={{
+            padding: "13px 44px", background: "transparent",
+            border: "2px solid #00ff88", borderRadius: 4, color: "#00ff88",
+            fontFamily: "'Orbitron', monospace", fontSize: 13, fontWeight: 700,
+            letterSpacing: "0.2em", cursor: "pointer",
+            textShadow: "0 0 10px #00ff88", boxShadow: "0 0 22px #00ff8833",
+          }}>
             {gameState === "DEAD" ? "ЗАНОВО" : "ИГРАТЬ"}
           </button>
           <div style={{ fontSize: 9, color: "#ffffff1a", letterSpacing: "0.15em", fontFamily: "'Rajdhani', sans-serif" }}>
-            ПРОБЕЛ · ТАП ПО ЭКРАНУ · УДЕРЖАНИЕ = ВЫСОКИЙ ПРЫЖОК
+            ПРОБЕЛ · ТАП — ПРЫЖОК · УДЕРЖАНИЕ — ВЫСОКИЙ ПРЫЖОК
           </div>
         </div>
       )}
