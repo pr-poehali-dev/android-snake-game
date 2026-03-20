@@ -12,6 +12,8 @@ const JUMP_V = 0.38;
 const HOLD_ADD = 0.018;
 const HOLD_MAX = 12;
 const PLAYER_Y_BASE = 0.5;
+const LANE_POSITIONS = [-LANE_W, 0, LANE_W]; // left, center, right
+const LANE_LERP = 0.14; // smoothness of lane switch
 const COIN_COLORS = [0x00ff88, 0x00cfff, 0xa855f7, 0xf97316, 0xfbbf24];
 const MERGE_PTS = [10, 30, 80, 200, 500];
 const MERGE_LABELS = ["1", "2", "3", "4", "5"];
@@ -63,6 +65,12 @@ export default function Index() {
   const boostT = useRef(0);
   const tiles = useRef<THREE.Object3D[]>([]);
   const lastSpawnZ = useRef(-12);
+  // Lane movement
+  const currentLane = useRef(1); // 0=left, 1=center, 2=right
+  const targetX = useRef(0);
+  const playerX = useRef(0);
+  const laneChanging = useRef(false);
+  const touchStartX = useRef<number | null>(null);
 
   // ── Init Three.js ──
   const initThree = useCallback(() => {
@@ -279,6 +287,13 @@ export default function Index() {
       pm.position.y = playerY.current;
       pm.rotation.x += spd * 0.45;
 
+      // Lane X movement (smooth lerp)
+      playerX.current += (targetX.current - playerX.current) * LANE_LERP;
+      pm.position.x = playerX.current;
+      // Tilt ball sideways while moving
+      pm.rotation.z = (targetX.current - playerX.current) * 0.18;
+      if (Math.abs(targetX.current - playerX.current) < 0.02) laneChanging.current = false;
+
       // Advance world
       pm.position.z -= spd;
 
@@ -407,6 +422,10 @@ export default function Index() {
     onGround.current = true;
     jumpHeld.current = false;
     holdFrames.current = HOLD_MAX;
+    currentLane.current = 1;
+    targetX.current = 0;
+    playerX.current = 0;
+    laneChanging.current = false;
     const pm = playerMesh.current!;
     pm.position.set(0, PLAYER_Y_BASE, 0);
     lastSpawnZ.current = pm.position.z - 12;
@@ -415,6 +434,24 @@ export default function Index() {
     setScore(0);
     setInv([]);
     setBonusBars({ magnet: 0, shield: 0, boost: 0 });
+  }, []);
+
+  const moveLeft = useCallback(() => {
+    if (gs.current !== "PLAYING") return;
+    if (currentLane.current > 0) {
+      currentLane.current--;
+      targetX.current = LANE_POSITIONS[currentLane.current];
+      laneChanging.current = true;
+    }
+  }, []);
+
+  const moveRight = useCallback(() => {
+    if (gs.current !== "PLAYING") return;
+    if (currentLane.current < 2) {
+      currentLane.current++;
+      targetX.current = LANE_POSITIONS[currentLane.current];
+      laneChanging.current = true;
+    }
   }, []);
 
   const pressJump = useCallback(() => {
@@ -430,8 +467,12 @@ export default function Index() {
   useEffect(() => {
     const cleanup = initThree();
     rafRef.current = requestAnimationFrame(loop);
-    const onDown = (e: KeyboardEvent) => { if (e.code === "Space") { e.preventDefault(); pressJump(); } };
-    const onUp = (e: KeyboardEvent) => { if (e.code === "Space") releaseJump(); };
+    const onDown = (e: KeyboardEvent) => {
+      if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW") { e.preventDefault(); pressJump(); }
+      if (e.code === "ArrowLeft" || e.code === "KeyA") { e.preventDefault(); moveLeft(); }
+      if (e.code === "ArrowRight" || e.code === "KeyD") { e.preventDefault(); moveRight(); }
+    };
+    const onUp = (e: KeyboardEvent) => { if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW") releaseJump(); };
     window.addEventListener("keydown", onDown);
     window.addEventListener("keyup", onUp);
     return () => {
@@ -440,13 +481,26 @@ export default function Index() {
       window.removeEventListener("keydown", onDown);
       window.removeEventListener("keyup", onUp);
     };
-  }, [initThree, loop, pressJump, releaseJump]);
+  }, [initThree, loop, pressJump, releaseJump, moveLeft, moveRight]);
 
   const accentColor = boostT.current > 0 ? "#fbbf24" : magnetT.current > 0 ? "#ec4899" : "#00ff88";
 
   return (
     <div style={{ width: "100dvw", height: "100dvh", background: "#030712", position: "relative", overflow: "hidden", fontFamily: "'Orbitron', monospace", userSelect: "none" }}>
-      <div ref={mountRef} style={{ position: "absolute", inset: 0 }} onPointerDown={pressJump} onPointerUp={releaseJump} />
+      <div
+        ref={mountRef}
+        style={{ position: "absolute", inset: 0 }}
+        onPointerDown={(e) => { touchStartX.current = e.clientX; pressJump(); }}
+        onPointerUp={releaseJump}
+        onTouchStart={(e) => { touchStartX.current = e.touches[0].clientX; }}
+        onTouchEnd={(e) => {
+          if (touchStartX.current === null) return;
+          const dx = e.changedTouches[0].clientX - touchStartX.current;
+          if (Math.abs(dx) > 35) { if (dx < 0) moveLeft(); else moveRight(); }
+          touchStartX.current = null;
+          releaseJump();
+        }}
+      />
 
       {/* Score HUD */}
       <div style={{ position: "absolute", top: 0, left: 0, right: 0, zIndex: 20, display: "flex", justifyContent: "space-between", padding: "14px 18px", pointerEvents: "none" }}>
@@ -519,8 +573,9 @@ export default function Index() {
           }}>
             {gameState === "DEAD" ? "ЗАНОВО" : "ИГРАТЬ"}
           </button>
-          <div style={{ fontSize: 9, color: "#ffffff1a", letterSpacing: "0.15em", fontFamily: "'Rajdhani', sans-serif" }}>
-            ПРОБЕЛ · ТАП — ПРЫЖОК · УДЕРЖАНИЕ — ВЫСОКИЙ ПРЫЖОК
+          <div style={{ fontSize: 9, color: "#ffffff1a", letterSpacing: "0.1em", fontFamily: "'Rajdhani', sans-serif", textAlign: "center", lineHeight: 1.9 }}>
+            ← → / A D — СМЕНА ПОЛОСЫ · СВАЙП ВЛЕВО/ВПРАВО<br />
+            ПРОБЕЛ / ↑ / ТАП — ПРЫЖОК · УДЕРЖАНИЕ — ВЫСОКИЙ ПРЫЖОК
           </div>
         </div>
       )}
